@@ -261,7 +261,7 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
       // check if the user has recent events on some items
       val recentItems: Set[String] = {
         val items = if (query.user.isDefined) getRecentItems(query) else query.item.getOrElse(Set.empty[String])
-        if (query.userHistoryAsSeed.getOrElse(false)) {
+        if (query.userHistoryAsSeed.getOrElse(false) && items.nonEmpty) {
           Set(items.toVector(util.Random.nextInt(Math.max(0, items.size))))
         } else items
       }
