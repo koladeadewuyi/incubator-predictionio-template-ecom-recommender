@@ -4,21 +4,24 @@
   "engineFactory": "org.example.ecommercerecommendation.ECommerceRecommendationEngine",
   "datasource": {
     "params" : {
-      "appName": "INVALID_APP_NAME"
+      "appName": "CassTest",
+      "seenEvents": ["recommendable", "non_recommendable"],
+      "similarEvents": ["non_recommendable"]
     }
   },
   "algorithms": [
     {
       "name": "ecomm",
       "params": {
-        "appName": "INVALID_APP_NAME",
-        "unseenOnly": true,
-        "seenEvents": ["buy", "view"],
-        "similarEvents": ["view"],
+        "appName": "CassTest",
+        "unseenOnly": false,
+        "seenEvents": ["recommendable", "non_recommendable"],
+        "similarEvents": ["recommendable"],
         "rank": 10,
-        "numIterations" : 20,
+        "numIterations" : 5,
         "lambda": 0.01,
-        "seed": 3
+        "seed": 3,
+        "dontRecommendFieldName": "dontRecommend"
       }
     }
   ]

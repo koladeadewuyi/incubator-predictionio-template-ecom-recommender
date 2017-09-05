@@ -15,7 +15,9 @@ import org.apache.spark.rdd.RDD
 import grizzled.slf4j.Logger
 
 import scala.collection.mutable.PriorityQueue
+import scala.collection.parallel.immutable.ParMap
 import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
 
 case class ECommAlgorithmParams(
@@ -26,7 +28,8 @@ case class ECommAlgorithmParams(
   rank: Int,
   numIterations: Int,
   lambda: Double,
-  seed: Option[Long]
+  seed: Option[Long],
+  dontRecommendFieldName: String
 ) extends Params
 
 
@@ -63,6 +66,9 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
   extends P2LAlgorithm[PreparedData, ECommModel, Query, PredictedResult] {
 
   @transient lazy val logger = Logger[this.type]
+
+  lazy val eventCache = LocalCache.events
+  lazy val resultCache = LocalCache.results
 
   def train(sc: SparkContext, data: PreparedData): ECommModel = {
     require(!data.viewEvents.take(1).isEmpty,
@@ -218,8 +224,8 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
 
   def predict(model: ECommModel, query: Query): PredictedResult = {
 
-    val userFeatures = model.userFeatures
-    val productModels = model.productModels
+    val seqUserFeatures = model.userFeatures
+    val seqProductModels = model.productModels
 
     // convert whiteList's string ID to integer index
     val whiteList: Option[Set[Int]] = query.whiteList.map( set =>
@@ -230,16 +236,19 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
       // convert seen Items list from String ID to interger Index
       .flatMap(x => model.itemStringIntMap.get(x))
 
-    val userFeature: Option[Array[Double]] =
-      model.userStringIntMap.get(query.user).flatMap { userIndex =>
-        userFeatures.get(userIndex)
+    val userFeature: Option[Array[Double]] = {
+      query.user.flatMap { userId =>
+        model.userStringIntMap.get(userId).flatMap { userIndex =>
+          seqUserFeatures.get(userIndex)
+        }
       }
+    }
 
-    val topScores: Array[(Int, Double)] = if (userFeature.isDefined) {
+    val topScores: Array[(Int, Double)] = if (!query.userHistoryAsSeed.getOrElse(false) && userFeature.isDefined) {
       // the user has feature vector
       predictKnownUser(
         userFeature = userFeature.get,
-        productModels = productModels,
+        productModels = seqProductModels,
         query = query,
         whiteList = whiteList,
         blackList = finalBlackList
@@ -247,35 +256,50 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
     } else {
       // the user doesn't have feature vector.
       // For example, new user is created after model is trained.
-      logger.info(s"No userFeature found for user ${query.user}.")
+      logger.debug(s"No userFeature found for user ${query.user}.")
 
       // check if the user has recent events on some items
-      val recentItems: Set[String] = getRecentItems(query)
+      val recentItems: Set[String] = {
+        val items = if (query.user.isDefined) getRecentItems(query) else query.item.getOrElse(Set.empty[String])
+        if (query.userHistoryAsSeed.getOrElse(false)) {
+          Set(items.toVector(util.Random.nextInt(Math.max(0, items.size))))
+        } else items
+      }
+
       val recentList: Set[Int] = recentItems.flatMap (x =>
         model.itemStringIntMap.get(x))
 
       val recentFeatures: Vector[Array[Double]] = recentList.toVector
         // productModels may not contain the requested item
         .map { i =>
-          productModels.get(i).flatMap { pm => pm.features }
+          seqProductModels.get(i).flatMap { pm => pm.features }
         }.flatten
 
       if (recentFeatures.isEmpty) {
-        logger.info(s"No features vector for recent items ${recentItems}.")
-        predictDefault(
-          productModels = productModels,
-          query = query,
-          whiteList = whiteList,
-          blackList = finalBlackList
-        )
+        logger.debug(s"No features vector for recent items ${recentItems}.")
+        resultCache.get("default").getOrElse {
+          val defaultPrediction = predictDefault(
+            productModels = seqProductModels,
+            query = query,
+            whiteList = whiteList,
+            blackList = finalBlackList
+          )
+          resultCache.set("default", defaultPrediction)
+          defaultPrediction
+        }
       } else {
-        predictSimilar(
-          recentFeatures = recentFeatures,
-          productModels = productModels,
-          query = query,
-          whiteList = whiteList,
-          blackList = finalBlackList
-        )
+        val items = recentList.mkString
+        resultCache.get(items).getOrElse {
+          val similarPrediction = predictSimilar(
+            recentFeatures = recentFeatures,
+            productModels = seqProductModels,
+            query = query,
+            whiteList = whiteList,
+            blackList = finalBlackList
+          )
+          resultCache.set(items, similarPrediction)
+          similarPrediction
+        }
       }
     }
 
@@ -292,19 +316,20 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
 
   /** Generate final blackList based on other constraints */
   def genBlackList(query: Query): Set[String] = {
-    // if unseenOnly is True, get all seen items
-    val seenItems: Set[String] = if (ap.unseenOnly) {
+    // if unseenOnly is True, get all seen items. If set in query overrides value in engine.json
+    val unseenOnly = query.unseenOnly.getOrElse(ap.unseenOnly)
+    val seenItems: Set[String] = if (query.user.nonEmpty && unseenOnly) {
 
       // get all user item events which are considered as "seen" events
       val seenEvents: Iterator[Event] = try {
         LEventStore.findByEntity(
           appName = ap.appName,
           entityType = "user",
-          entityId = query.user,
+          entityId = query.user.get,
           eventNames = Some(ap.seenEvents),
           targetEntityType = Some(Some("item")),
           // set time limit to avoid super long DB access
-          timeout = Duration(200, "millis")
+          timeout = Duration(100, "millis")
         )
       } catch {
         case e: scala.concurrent.TimeoutException =>
@@ -331,60 +356,71 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
     }
 
     // get the latest constraint unavailableItems $set event
-    val unavailableItems: Set[String] = try {
-      val constr = LEventStore.findByEntity(
-        appName = ap.appName,
-        entityType = "constraint",
-        entityId = "unavailableItems",
-        eventNames = Some(Seq("$set")),
-        limit = Some(1),
-        latest = true,
-        timeout = Duration(200, "millis")
-      )
-      if (constr.hasNext) {
-        constr.next.properties.get[Set[String]]("items")
-      } else {
-        Set[String]()
-      }
-    } catch {
-      case e: scala.concurrent.TimeoutException =>
-        logger.error(s"Timeout when read set unavailableItems event." +
-          s" Empty list is used. ${e}")
-        Set[String]()
-      case e: Exception =>
-        logger.error(s"Error when read set unavailableItems event: ${e}")
-        throw e
-    }
+//    val unavailableItems: Set[String] = try {
+//      val constr = LEventStore.findByEntity(
+//        appName = ap.appName,
+//        entityType = "constraint",
+//        entityId = "unavailableItems",
+//        eventNames = Some(Seq("$set")),
+//        limit = Some(1),
+//        latest = true,
+//        timeout = Duration(100, "millis")
+//      )
+//      if (constr.hasNext) {
+//        constr.next.properties.get[Set[String]]("items")
+//      } else {
+//        Set[String]()
+//      }
+//    } catch {
+//      case e: scala.concurrent.TimeoutException =>
+//        logger.error(s"Timeout when read set unavailableItems event." +
+//          s" Empty list is used. ${e}")
+//        Set[String]()
+//      case e: Exception =>
+//        logger.error(s"Error when read set unavailableItems event: ${e}")
+//        throw e
+//    }
 
     // combine query's blackList,seenItems and unavailableItems
     // into final blackList.
-    query.blackList.getOrElse(Set[String]()) ++ seenItems ++ unavailableItems
+    query.blackList.getOrElse(Set[String]()) ++ seenItems
+//    ++ unavailableItems
   }
 
   /** Get recent events of the user on items for recommending similar items */
   def getRecentItems(query: Query): Set[String] = {
-    // get latest 10 user view item events
-    val recentEvents = try {
-      LEventStore.findByEntity(
-        appName = ap.appName,
-        // entityType and entityId is specified for fast lookup
-        entityType = "user",
-        entityId = query.user,
-        eventNames = Some(ap.similarEvents),
-        targetEntityType = Some(Some("item")),
-        limit = Some(10),
-        latest = true,
-        // set time limit to avoid super long DB access
-        timeout = Duration(200, "millis")
-      )
-    } catch {
-      case e: scala.concurrent.TimeoutException =>
-        logger.error(s"Timeout when read recent events." +
-          s" Empty list is used. ${e}")
-        Iterator[Event]()
-      case e: Exception =>
-        logger.error(s"Error when read recent events: ${e}")
-        throw e
+    // get latest 100 user view item events
+    val recentEvents: Array[Event] = {
+      if (query.user.isEmpty) {
+        Array[Event]()
+      } else {
+        eventCache.getFromCache(query.user.get).getOrElse {
+          try {
+            val persistedEvents = LEventStore.findByEntity(
+              appName = ap.appName,
+              // entityType and entityId is specified for fast lookup
+              entityType = "user",
+              entityId = query.user.get,
+              eventNames = Some(ap.similarEvents),
+              targetEntityType = Some(Some("item")),
+              limit = Some(10),
+              latest = true,
+              // set time limit to avoid super long DB access
+              timeout = Duration(100, "millis")
+            ).toArray
+            eventCache.setInCache(query.user.get, persistedEvents)
+            persistedEvents
+          } catch {
+            case e: scala.concurrent.TimeoutException =>
+              logger.error(s"Timeout when read recent events." +
+                s" Empty list is used. ${e}")
+              Array[Event]()
+            case e: Exception =>
+              logger.error(s"Error when read recent events: ${e}")
+              throw e
+          }
+        }
+      }
     }
 
     val recentItems: Set[String] = recentEvents.map { event =>
@@ -409,7 +445,7 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
     whiteList: Option[Set[Int]],
     blackList: Set[Int]
   ): Array[(Int, Double)] = {
-    val indexScores: Map[Int, Double] = productModels.par // convert to parallel collection
+    val indexScores: Map[Int, Double] = productModels // convert to parallel collection
       .filter { case (i, pm) =>
         pm.features.isDefined &&
         isCandidateItem(
@@ -442,7 +478,7 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
     whiteList: Option[Set[Int]],
     blackList: Set[Int]
   ): Array[(Int, Double)] = {
-    val indexScores: Map[Int, Double] = productModels.par // convert back to sequential collection
+    val indexScores: Map[Int, Double] = productModels // convert back to sequential collection
       .filter { case (i, pm) =>
         isCandidateItem(
           i = i,
@@ -472,7 +508,7 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
     whiteList: Option[Set[Int]],
     blackList: Set[Int]
   ): Array[(Int, Double)] = {
-    val indexScores: Map[Int, Double] = productModels.par // convert to parallel collection
+    val indexScores: Map[Int, Double] = productModels // convert to parallel collection
       .filter { case (i, pm) =>
         pm.features.isDefined &&
         isCandidateItem(
@@ -517,7 +553,7 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
       }
     }
 
-    q.dequeueAll.toSeq.reverse
+    q.dequeueAll.reverse
   }
 
   private
@@ -564,7 +600,8 @@ class ECommAlgorithm(val ap: ECommAlgorithmParams)
     categories.map { cat =>
       item.categories.map { itemCat =>
         // keep this item if has ovelap categories with the query
-        !(itemCat.toSet.intersect(cat).isEmpty)
+        val itemCatSet = itemCat.toSet
+        (!(itemCatSet.contains(ap.dontRecommendFieldName)) && !(itemCatSet.intersect(cat).isEmpty))
       }.getOrElse(false) // discard this item if it has no categories
     }.getOrElse(true)
 

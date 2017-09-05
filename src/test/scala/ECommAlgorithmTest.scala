@@ -18,13 +18,14 @@ class ECommAlgorithmTest
     rank = 10,
     numIterations = 20,
     lambda = 0.01,
-    seed = Some(3)
+    seed = Some(3),
+    dontRecommendFieldName = "dontRecommend"
   )
   val algorithm = new ECommAlgorithm(algorithmParams)
 
   val userStringIntMap = BiMap(Map("u0" -> 0, "u1" -> 1))
 
-  val itemStringIntMap = BiMap(Map("i0" -> 0, "i1" -> 1, "i2" -> 2))
+  val itemStringIntMap = BiMap(Map("i0" -> 0, "i1" -> 1, "i2" -> 2, "i3" -> 3))
 
   val users = Map("u0" -> User(), "u1" -> User())
 
@@ -32,11 +33,13 @@ class ECommAlgorithmTest
   val i0 = Item(categories = Some(List("c0", "c1")))
   val i1 = Item(categories = None)
   val i2 = Item(categories = Some(List("c0", "c2")))
+  val i3 = Item(categories = Some(List("c0", "c2", algorithmParams.dontRecommendFieldName)))
 
   val items = Map(
     "i0" -> i0,
     "i1" -> i1,
-    "i2" -> i2
+    "i2" -> i2,
+    "i3" -> i3
   )
 
   val view = Seq(
@@ -108,7 +111,7 @@ class ECommAlgorithmTest
         2 -> ProductModel(i2, Some(Array(1.0, 3.0, 1.0)), 1)
       ),
       query = Query(
-        user = "u0",
+        user = Some("u0"),
         num = 5,
         categories = Some(Set("c0")),
         whiteList = None,
@@ -130,7 +133,7 @@ class ECommAlgorithmTest
         2 -> ProductModel(i2, Some(Array(1.0, 3.0, 1.0)), 1)
       ),
       query = Query(
-        user = "u0",
+        user = Some("u0"),
         num = 5,
         categories = None,
         whiteList = None,
@@ -153,7 +156,7 @@ class ECommAlgorithmTest
         2 -> ProductModel(i2, Some(Array(1.0, 3.0, 1.0)), 1)
       ),
       query = Query(
-        user = "u0",
+        user = Some("u0"),
         num = 5,
         categories = Some(Set("c0")),
         whiteList = None,
@@ -168,5 +171,25 @@ class ECommAlgorithmTest
     top(1)._1 should be (expected(1)._1)
     top(0)._2 should be (expected(0)._2 plusOrMinus 0.001)
     top(1)._2 should be (expected(1)._2 plusOrMinus 0.001)
+  }
+
+  "ECommAlgorithm.predictSimilar()" should "exclude item with category 'dontRecommend'" in {
+
+    val top = algorithm.predictSimilar(
+      recentFeatures = Vector(Array(1.0, 2.0, 0.5), Array(1.0, 0.2, 0.3)),
+      productModels = Map(
+        3 -> ProductModel(i3, Some(Array(1.0, 3.0, 1.0)), 1)
+      ),
+      query = Query(
+        user = Some("u0"),
+        num = 5,
+        categories = Some(Set("c0")),
+        whiteList = None,
+        blackList = None),
+      whiteList = None,
+      blackList = Set()
+    )
+
+    top shouldBe empty
   }
 }

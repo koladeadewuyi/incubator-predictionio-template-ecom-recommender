@@ -13,7 +13,7 @@ import org.apache.spark.rdd.RDD
 
 import grizzled.slf4j.Logger
 
-case class DataSourceParams(appName: String) extends Params
+case class DataSourceParams(appName: String, seenEvents: List[String], similarEvents: List[String]) extends Params
 
 class DataSource(val dsp: DataSourceParams)
   extends PDataSource[TrainingData,
@@ -25,21 +25,21 @@ class DataSource(val dsp: DataSourceParams)
   def readTraining(sc: SparkContext): TrainingData = {
 
     // create a RDD of (entityID, User)
-    val usersRDD: RDD[(String, User)] = PEventStore.aggregateProperties(
-      appName = dsp.appName,
-      entityType = "user"
-    )(sc).map { case (entityId, properties) =>
-      val user = try {
-        User()
-      } catch {
-        case e: Exception => {
-          logger.error(s"Failed to get properties ${properties} of" +
-            s" user ${entityId}. Exception: ${e}.")
-          throw e
-        }
-      }
-      (entityId, user)
-    }.cache()
+//    val usersRDD: RDD[(String, User)] = PEventStore.aggregateProperties(
+//      appName = dsp.appName,
+//      entityType = "user"
+//    )(sc).map { case (entityId, properties) =>
+//      val user = try {
+//        User()
+//      } catch {
+//        case e: Exception => {
+//          logger.error(s"Failed to get properties ${properties} of" +
+//            s" user ${entityId}. Exception: ${e}.")
+//          throw e
+//        }
+//      }
+//      (entityId, user)
+//    }.cache()
 
     // create a RDD of (entityID, Item)
     val itemsRDD: RDD[(String, Item)] = PEventStore.aggregateProperties(
@@ -48,7 +48,7 @@ class DataSource(val dsp: DataSourceParams)
     )(sc).map { case (entityId, properties) =>
       val item = try {
         // Assume categories is optional property of item.
-        Item(categories = properties.getOpt[List[String]]("categories"))
+        Item(categories = properties.getOpt[List[String]]("tags"))
       } catch {
         case e: Exception => {
           logger.error(s"Failed to get properties ${properties} of" +
@@ -62,13 +62,26 @@ class DataSource(val dsp: DataSourceParams)
     val eventsRDD: RDD[Event] = PEventStore.find(
       appName = dsp.appName,
       entityType = Some("user"),
-      eventNames = Some(List("view", "buy")),
+      eventNames = Some(dsp.seenEvents),
       // targetEntityType is optional field of an event.
       targetEntityType = Some(Some("item")))(sc)
       .cache()
 
+    val usersRDD: RDD[(String, User)] = eventsRDD
+      .map { event =>
+        val user = try {
+          User()
+        } catch {
+          case e: Exception =>
+            logger.error(s"Cannot convert ${event} to User." +
+              s" Exception: ${e}.")
+            throw e
+        }
+      (event.entityId, user)
+    }.distinct()
+
     val viewEventsRDD: RDD[ViewEvent] = eventsRDD
-      .filter { event => event.event == "view" }
+      .filter { event => dsp.seenEvents.head.equals(event.event) }
       .map { event =>
         try {
           ViewEvent(
@@ -85,7 +98,7 @@ class DataSource(val dsp: DataSourceParams)
       }
 
     val buyEventsRDD: RDD[BuyEvent] = eventsRDD
-      .filter { event => event.event == "buy" }
+      .filter { event => dsp.similarEvents.contains(event.event) }
       .map { event =>
         try {
           BuyEvent(
@@ -100,6 +113,12 @@ class DataSource(val dsp: DataSourceParams)
             throw e
         }
       }
+
+    logger.info(s"${eventsRDD.count()} distinct events found")
+    logger.info(s"${buyEventsRDD.count()} distinct ${dsp.similarEvents} found")
+    logger.info(s"${viewEventsRDD.count()} distinct ${dsp.seenEvents.head} found")
+    logger.info(s"${usersRDD.count()} distinct users found")
+    logger.info(s"${itemsRDD.count()} distinct items found")
 
     new TrainingData(
       users = usersRDD,
